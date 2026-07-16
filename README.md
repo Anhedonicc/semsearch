@@ -4,6 +4,9 @@
 English and get the files that match by *meaning* — ranked and explained by
 the model, not just keyword grep.
 
+Two backends: a hosted default, or **Ollama for free local models with no API
+key** (`-provider ollama`) — so anyone can run it.
+
 ```console
 $ semsearch "where do we validate auth tokens?"
 1. internal/auth/verify.go  (95)
@@ -20,16 +23,23 @@ if it never uses the word "retry".
 
 ## Install
 
-Requires Go 1.21+ and an API key (from console.anthropic.com).
+Requires Go 1.21+.
 
 ```bash
-go install github.com/SimeLovesDoggos/semsearch@latest   # once published
+go install github.com/Anhedonicc/semsearch@latest   # once published
 # or, from this folder:
 go build -o semsearch .
 ```
 
+Then pick a backend:
+
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
+# Option A — hosted (default)
+export ANTHROPIC_API_KEY="sk-ant-..."      # key from console.anthropic.com
+
+# Option B — free & local, no API key (https://ollama.com)
+ollama pull llama3.2
+semsearch -provider ollama "..."
 ```
 
 ## Usage
@@ -43,10 +53,11 @@ semsearch -dry-run            # show what would be indexed, no API call
 
 | Flag | Default | Description |
 | --- | --- | --- |
+| `-provider` | `anthropic` | Backend: `anthropic` or `ollama` (local, keyless). Or `SEMSEARCH_PROVIDER` |
 | `-path` | `.` | Directory to search |
 | `-ext` | common code/text types | Comma-separated extensions to index |
 | `-top` | `5` | Number of results |
-| `-model` | `claude-opus-4-8` | Model id (or `SEMSEARCH_MODEL` env var) |
+| `-model` | per-provider | Model id (or `ANTHROPIC_MODEL` / `OLLAMA_MODEL`) |
 | `-snippet` | `1500` | Bytes read from the top of each file |
 | `-max-files` | `300` | Cap on files indexed |
 | `-dry-run` | `false` | Build the index and print it; skip the API call |

@@ -8,14 +8,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 )
@@ -44,7 +47,9 @@ func main() {
 		".go,.py,.cs,.js,.ts,.tsx,.jsx,.java,.rb,.php,.rs,.c,.cpp,.h,.hpp,.md,.txt,.json,.yaml,.yml,.toml,.sh",
 		"comma-separated file extensions to index")
 	top := flag.Int("top", 5, "number of results to return")
-	model := flag.String("model", envOr("SEMSEARCH_MODEL", "claude-opus-4-8"), "model id")
+	provider := flag.String("provider", envOr("SEMSEARCH_PROVIDER", "anthropic"),
+		"backend: anthropic (default) or ollama (local, keyless)")
+	model := flag.String("model", "", "model id (defaults per provider)")
 	snippetBytes := flag.Int("snippet", 1500, "max bytes read from the top of each file")
 	maxFiles := flag.Int("max-files", 300, "max files to index")
 	dryRun := flag.Bool("dry-run", false, "build the index and print it; do not call the API")
@@ -84,12 +89,21 @@ func main() {
 		return
 	}
 
-	if os.Getenv("ANTHROPIC_API_KEY") == "" {
-		fmt.Fprintln(os.Stderr, "error: ANTHROPIC_API_KEY is not set")
+	if *provider == "anthropic" && os.Getenv("ANTHROPIC_API_KEY") == "" {
+		fmt.Fprintln(os.Stderr, "error: ANTHROPIC_API_KEY is not set (or use -provider ollama)")
 		os.Exit(1)
 	}
 
-	results, err := search(context.Background(), *model, query, index, *top)
+	resolvedModel := *model
+	if resolvedModel == "" {
+		if *provider == "ollama" {
+			resolvedModel = envOr("OLLAMA_MODEL", "llama3.2")
+		} else {
+			resolvedModel = envOr("ANTHROPIC_MODEL", "claude-opus-4-8")
+		}
+	}
+
+	results, err := search(context.Background(), *provider, resolvedModel, query, index, *top)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -169,9 +183,7 @@ func renderIndex(files []indexedFile) string {
 	return sb.String()
 }
 
-func search(ctx context.Context, model, query, index string, top int) ([]result, error) {
-	client := anthropic.NewClient()
-
+func search(ctx context.Context, provider, model, query, index string, top int) ([]result, error) {
 	system := "You are a semantic code search engine. You receive a natural-language QUERY " +
 		"and an INDEX of files, each with a snippet from the top of the file. Rank files by how " +
 		"well they match the intent and meaning of the query, not just keyword overlap. Respond " +
@@ -182,6 +194,32 @@ func search(ctx context.Context, model, query, index string, top int) ([]result,
 	user := fmt.Sprintf("QUERY: %s\n\nReturn the top %d most relevant files.\n\n=== INDEX ===\n%s",
 		query, top, index)
 
+	raw, err := complete(ctx, provider, model, system, user)
+	if err != nil {
+		return nil, err
+	}
+
+	var results []result
+	if err := json.Unmarshal([]byte(extractJSONArray(raw)), &results); err != nil {
+		return nil, fmt.Errorf("could not parse model response as JSON: %w\nraw: %s", err, raw)
+	}
+	if len(results) > top {
+		results = results[:top]
+	}
+	return results, nil
+}
+
+// complete sends a single system+user turn to the selected provider and returns
+// the model's reply text.
+func complete(ctx context.Context, provider, model, system, user string) (string, error) {
+	if provider == "ollama" {
+		return ollamaChat(ctx, model, system, user)
+	}
+	return anthropicChat(ctx, model, system, user)
+}
+
+func anthropicChat(ctx context.Context, model, system, user string) (string, error) {
+	client := anthropic.NewClient()
 	resp, err := client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     anthropic.Model(model),
 		MaxTokens: 4096,
@@ -191,25 +229,54 @@ func search(ctx context.Context, model, query, index string, top int) ([]result,
 		},
 	})
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-
 	var text strings.Builder
 	for _, block := range resp.Content {
 		if tb, ok := block.AsAny().(anthropic.TextBlock); ok {
 			text.WriteString(tb.Text)
 		}
 	}
+	return text.String(), nil
+}
 
-	js := extractJSONArray(text.String())
-	var results []result
-	if err := json.Unmarshal([]byte(js), &results); err != nil {
-		return nil, fmt.Errorf("could not parse model response as JSON: %w\nraw: %s", err, text.String())
+// ollamaChat calls a local Ollama server — no API key required. Override the
+// default host (http://localhost:11434) with OLLAMA_HOST.
+func ollamaChat(ctx context.Context, model, system, user string) (string, error) {
+	host := envOr("OLLAMA_HOST", "http://localhost:11434")
+	reqBody, _ := json.Marshal(map[string]any{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "system", "content": system},
+			{"role": "user", "content": user},
+		},
+		"stream": false,
+		"format": "json",
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		strings.TrimRight(host, "/")+"/api/chat", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", err
 	}
-	if len(results) > top {
-		results = results[:top]
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := (&http.Client{Timeout: 3 * time.Minute}).Do(req)
+	if err != nil {
+		return "", err
 	}
-	return results, nil
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ollama returned %s", resp.Status)
+	}
+	var out struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	return out.Message.Content, nil
 }
 
 // extractJSONArray pulls the outermost [...] out of a response, tolerating any

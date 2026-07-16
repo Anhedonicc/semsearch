@@ -1,4 +1,4 @@
-module github.com/SimeLovesDoggos/semsearch
+module github.com/Anhedonicc/semsearch
 
 go 1.26.5
 
