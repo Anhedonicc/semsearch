@@ -1,0 +1,7 @@
+# Built binaries
+semsearch
+semsearch.exe
+
+# Go
+*.test
+*.out
