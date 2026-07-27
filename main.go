@@ -5,9 +5,11 @@
 //
 //	semsearch "where do we validate auth tokens?"
 //	semsearch -path ./src -top 3 "the retry/backoff logic"
+//	semsearch -provider ollama -json "database connection pool"
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -34,11 +36,16 @@ type indexedFile struct {
 	snippet string
 }
 
-// Directories that are never worth searching.
-var skipDirs = map[string]bool{
-	".git": true, "node_modules": true, "vendor": true, "bin": true,
-	"obj": true, ".venv": true, "venv": true, "dist": true, "build": true,
-	".idea": true, ".vs": true, "target": true, "__pycache__": true,
+// Baseline set of directories that are never worth searching. Extended at
+// runtime by directory-name entries in a root-level .gitignore.
+var defaultSkipDirs = []string{
+	".git", ".hg", ".svn",
+	"node_modules", "vendor", "bower_components",
+	"bin", "obj", "target", "dist", "build", "out",
+	".venv", "venv", "env", "__pycache__", ".pytest_cache", ".mypy_cache",
+	".idea", ".vs", ".vscode",
+	".next", ".nuxt", ".svelte-kit", ".turbo",
+	"coverage", ".cache",
 }
 
 func main() {
@@ -52,7 +59,10 @@ func main() {
 	model := flag.String("model", "", "model id (defaults per provider)")
 	snippetBytes := flag.Int("snippet", 1500, "max bytes read from the top of each file")
 	maxFiles := flag.Int("max-files", 300, "max files to index")
+	noIgnore := flag.Bool("no-gitignore", false, "don't read directory names from .gitignore")
+	asJSON := flag.Bool("json", false, "output results as a JSON array (for scripting)")
 	dryRun := flag.Bool("dry-run", false, "build the index and print it; do not call the API")
+	verbose := flag.Bool("v", false, "print an index summary to stderr")
 	flag.Parse()
 
 	query := strings.TrimSpace(strings.Join(flag.Args(), " "))
@@ -69,7 +79,14 @@ func main() {
 		}
 	}
 
-	files, truncated, err := buildIndex(*path, exts, *snippetBytes, *maxFiles)
+	skipDirs := buildSkipSet(defaultSkipDirs)
+	if !*noIgnore {
+		for _, d := range readGitignoreDirs(*path) {
+			skipDirs[d] = true
+		}
+	}
+
+	files, truncated, err := buildIndex(*path, exts, skipDirs, *snippetBytes, *maxFiles)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -81,8 +98,11 @@ func main() {
 
 	index := renderIndex(files)
 
+	if *verbose || *dryRun {
+		fmt.Fprintf(os.Stderr, "indexed %d files (%d bytes of context)%s\n",
+			len(files), len(index), truncNote(truncated))
+	}
 	if *dryRun {
-		fmt.Printf("indexed %d files (%d bytes of context)%s\n", len(files), len(index), truncNote(truncated))
 		for _, f := range files {
 			fmt.Println("  ", f.path)
 		}
@@ -103,22 +123,71 @@ func main() {
 		}
 	}
 
-	results, err := search(context.Background(), *provider, resolvedModel, query, index, *top)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	results, err := search(ctx, *provider, resolvedModel, query, index, *top)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
+	}
+	sort.SliceStable(results, func(i, j int) bool { return results[i].Score > results[j].Score })
+
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(results)
+		return
 	}
 	if len(results) == 0 {
 		fmt.Println("No relevant files found.")
 		return
 	}
-	sort.SliceStable(results, func(i, j int) bool { return results[i].Score > results[j].Score })
 	for i, r := range results {
 		fmt.Printf("%d. %s  (%.0f)\n   %s\n", i+1, r.Path, r.Score, r.Reason)
 	}
 }
 
-func buildIndex(root string, exts map[string]bool, snippetBytes, maxFiles int) ([]indexedFile, bool, error) {
+func buildSkipSet(names []string) map[string]bool {
+	m := map[string]bool{}
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
+}
+
+// readGitignoreDirs pulls plain directory-name entries out of the root
+// .gitignore (`dist/`, `build`, `.turbo/`, etc.). Glob patterns (`*.log`,
+// `**/foo`) are ignored — we only extend the directory skip set. This is
+// intentionally simple: a full gitignore parser would be a whole dependency
+// for modest additional value.
+func readGitignoreDirs(root string) []string {
+	f, err := os.Open(filepath.Join(root, ".gitignore"))
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var out []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "!") {
+			continue
+		}
+		if strings.ContainsAny(line, "*?[") || strings.Contains(line, "/") && !strings.HasSuffix(line, "/") {
+			continue // glob or path expression → skip
+		}
+		line = strings.TrimSuffix(line, "/")
+		if line == "" || strings.Contains(line, "/") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+func buildIndex(root string, exts, skipDirs map[string]bool, snippetBytes, maxFiles int) ([]indexedFile, bool, error) {
 	var out []indexedFile
 	truncated := false
 	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
@@ -162,7 +231,10 @@ func buildIndex(root string, exts map[string]bool, snippetBytes, maxFiles int) (
 
 // isBinary reports whether data looks non-textual (contains a NUL byte).
 func isBinary(b []byte) bool {
-	n := min(len(b), 8000)
+	n := len(b)
+	if n > 8000 {
+		n = 8000
+	}
 	for i := 0; i < n; i++ {
 		if b[i] == 0 {
 			return true

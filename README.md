@@ -55,6 +55,9 @@ semsearch -dry-run            # show what would be indexed, no API call
 | --- | --- | --- |
 | `-provider` | `anthropic` | Backend: `anthropic` or `ollama` (local, keyless). Or `SEMSEARCH_PROVIDER` |
 | `-path` | `.` | Directory to search |
+| `-json` | `false` | Emit results as a JSON array (for scripting) |
+| `-no-gitignore` | `false` | Don't read directory names from the root `.gitignore` |
+| `-v` | `false` | Print an index summary to stderr |
 | `-ext` | common code/text types | Comma-separated extensions to index |
 | `-top` | `5` | Number of results |
 | `-model` | per-provider | Model id (or `ANTHROPIC_MODEL` / `OLLAMA_MODEL`) |
