@@ -1,6 +1,9 @@
-# Built binaries
-semsearch
-semsearch.exe
+# Built binaries — anchored so we don't ignore any `semsearch` directory.
+/semsearch
+/semsearch.exe
+
+# Embed-mode cache (created next to the searched code)
+.semsearch-cache.json
 
 # Go
 *.test

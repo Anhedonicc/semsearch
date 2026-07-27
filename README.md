@@ -1,29 +1,38 @@
 # semsearch
 
-**Semantic code search.** Ask a question about a codebase in plain
-English and get the files that match by *meaning* — ranked and explained by
-the model, not just keyword grep.
+**Semantic code search.** Ask a codebase a question in plain English and get
+back the code that matches by *meaning* — not just keyword grep.
 
-Two backends: a hosted default, or **Ollama for free local models with no API
-key** (`-provider ollama`) — so anyone can run it.
+Two modes:
 
-```console
-$ semsearch "where do we validate auth tokens?"
-1. internal/auth/verify.go  (95)
-   Contains the token signature + expiry checks used by the middleware.
-2. middleware/session.go  (70)
-   Calls the verifier on every request and rejects invalid tokens.
+- **`embed` — real embedding search**, powered by a local Ollama server with
+  the free `nomic-embed-text` model. **No API key required.** The index is
+  cached on disk; re-runs only re-embed files whose (size, mtime) changed.
+  Results are **line-level**, showing which chunk of a file matched.
+- **`rank` — LLM ranking** via a hosted model. Sends a compact index to
+  Claude and asks it to rank matches. Good for medium codebases with no
+  local setup.
+
+Default: `embed` when `-provider ollama`, `rank` when `-provider anthropic`.
+
+```bash
+# Free/local: embed once, then query
+ollama pull nomic-embed-text
+semsearch -provider ollama "where do we validate auth tokens?"
+# 1. internal/auth/verify.go:23-56  (78)
+#    func VerifyToken(tok string) (Claims, error) {
+# 2. middleware/session.go:18-52  (65)
+#    signed := r.Header.Get("Authorization")
+# ...
+
+# Hosted: LLM-ranking mode
+semsearch "the retry/backoff logic"
+
+# Explicit mode override
+semsearch -mode embed -embed-model nomic-embed-text "database connection pool"
 ```
 
-## Why it's different from grep
-
-`grep "token"` finds the word "token". `semsearch` understands *intent* — a
-query like "the retry/backoff logic" finds the exponential-backoff function even
-if it never uses the word "retry".
-
 ## Install
-
-Requires Go 1.21+.
 
 ```bash
 go install github.com/Anhedonicc/semsearch@latest   # once published
@@ -34,47 +43,55 @@ go build -o semsearch .
 Then pick a backend:
 
 ```bash
-# Option A — hosted (default)
-export ANTHROPIC_API_KEY="sk-ant-..."      # key from console.anthropic.com
+# Option A — free & local (no API key)  ← the exciting one
+ollama pull nomic-embed-text   # or any other embedding model on the Ollama registry
+semsearch -provider ollama "some plain-english query"
 
-# Option B — free & local, no API key (https://ollama.com)
-ollama pull llama3.2
-semsearch -provider ollama "..."
+# Option B — hosted (Claude does the ranking on a text index)
+export ANTHROPIC_API_KEY="sk-ant-..."
+semsearch "some plain-english query"
 ```
 
-## Usage
-
-```bash
-semsearch "how is rate limiting implemented?"
-semsearch -path ./src -top 3 "the database connection pool"
-semsearch -ext .go,.md "where is the config parsed?"
-semsearch -dry-run            # show what would be indexed, no API call
-```
+## Flags
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `-provider` | `anthropic` | Backend: `anthropic` or `ollama` (local, keyless). Or `SEMSEARCH_PROVIDER` |
+| `-mode` | auto | `embed` (local embeddings) or `rank` (LLM ranking). Defaults per provider. |
+| `-provider` | `anthropic` | Backend for `rank` mode: `anthropic` or `ollama` (both keyless in embed mode) |
+| `-embed-model` | `nomic-embed-text` | Embedding model id for `embed` mode. Or `SEMSEARCH_EMBED_MODEL` |
+| `-model` | per-provider | Chat model id for `rank` mode. Or `ANTHROPIC_MODEL` / `OLLAMA_MODEL` |
+| `-cache` | `<path>/.semsearch-cache.json` | Where the embed index is stored |
 | `-path` | `.` | Directory to search |
+| `-top` | `5` | Number of results |
+| `-ext` | (many) | Comma-separated extensions to index |
 | `-json` | `false` | Emit results as a JSON array (for scripting) |
 | `-no-gitignore` | `false` | Don't read directory names from the root `.gitignore` |
-| `-v` | `false` | Print an index summary to stderr |
-| `-ext` | common code/text types | Comma-separated extensions to index |
-| `-top` | `5` | Number of results |
-| `-model` | per-provider | Model id (or `ANTHROPIC_MODEL` / `OLLAMA_MODEL`) |
-| `-snippet` | `1500` | Bytes read from the top of each file |
-| `-max-files` | `300` | Cap on files indexed |
-| `-dry-run` | `false` | Build the index and print it; skip the API call |
+| `-v` | `false` | Print an index summary to stderr (which files were cached vs. embedded) |
+| `-snippet` | `1500` | Rank mode: bytes read from the top of each file |
+| `-max-files` | `300` | Rank mode: max files in the LLM index |
+| `-dry-run` | `false` | Rank mode: print the index without calling the model |
 
-## How it works
+The embed cache defaults to `.semsearch-cache.json` in the searched directory —
+add that line to your `.gitignore`. Rebuild from scratch by deleting it.
 
-1. Walks the directory, skipping `.git`, `node_modules`, `bin`, etc.
-2. Reads a snippet from the top of each text file into a compact index.
-3. Sends the query + index to the model, which ranks files by semantic relevance
-   and returns structured JSON with a score and reason per file.
+## How embed mode works
 
-**Limitations (v1):** ranking uses a snippet from the top of each file, so a
-match buried deep in a large file may be missed. A future version can chunk
-files and/or add a true embedding index for larger codebases.
+1. Walks the directory, honoring your `.gitignore` for skip-dirs.
+2. Splits each text file into overlapping ~40-line chunks.
+3. For any chunk not in the cache (new file, or file whose size/mtime changed),
+   calls Ollama's `/api/embed` in batches to get a vector per chunk.
+4. Saves the cache atomically.
+5. Embeds the query, scores every cached chunk by cosine similarity, and
+   returns the top-K with their line ranges.
+
+First run over ~2k files takes a few minutes (all-embedding); subsequent
+runs are instant unless files have changed.
+
+## Tests
+
+```bash
+go test ./...
+```
 
 ## License
 

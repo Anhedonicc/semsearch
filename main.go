@@ -1,15 +1,23 @@
 // semsearch — semantic code search.
 //
-// Ask a question about a codebase in plain English and get back the files that
-// match by *meaning*, ranked and explained by the model — not just keyword grep.
+// Two modes:
+//
+//   - -mode rank   (default when -provider anthropic)
+//       Sends a compact index of the codebase to a hosted LLM and asks it
+//       to rank the top matches. Good for medium codebases, no local setup.
+//
+//   - -mode embed  (default when -provider ollama)
+//       Embeds every code chunk locally with Ollama's nomic-embed-text (free,
+//       no API key), caches the vectors on disk, and scores queries with
+//       cosine similarity. Results are line-level. Second run reuses the
+//       cache and only re-embeds changed files.
 //
 //	semsearch "where do we validate auth tokens?"
-//	semsearch -path ./src -top 3 "the retry/backoff logic"
-//	semsearch -provider ollama -json "database connection pool"
+//	semsearch -provider ollama "the retry/backoff logic"     # embed mode by default
+//	semsearch -mode embed -embed-model nomic-embed-text "database connection pool"
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -17,7 +25,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -54,14 +61,20 @@ func main() {
 		".go,.py,.cs,.js,.ts,.tsx,.jsx,.java,.rb,.php,.rs,.c,.cpp,.h,.hpp,.md,.txt,.json,.yaml,.yml,.toml,.sh",
 		"comma-separated file extensions to index")
 	top := flag.Int("top", 5, "number of results to return")
+	mode := flag.String("mode", "",
+		"search mode: rank (LLM ranking) or embed (local embeddings). Default: rank for anthropic, embed for ollama.")
 	provider := flag.String("provider", envOr("SEMSEARCH_PROVIDER", "anthropic"),
-		"backend: anthropic (default) or ollama (local, keyless)")
-	model := flag.String("model", "", "model id (defaults per provider)")
-	snippetBytes := flag.Int("snippet", 1500, "max bytes read from the top of each file")
-	maxFiles := flag.Int("max-files", 300, "max files to index")
+		"backend for rank mode: anthropic (default) or ollama (local, keyless)")
+	model := flag.String("model", "", "model id for rank mode (defaults per provider)")
+	embedModel := flag.String("embed-model", envOr("SEMSEARCH_EMBED_MODEL", "nomic-embed-text"),
+		"embedding model id for embed mode (uses local Ollama; run `ollama pull nomic-embed-text` first)")
+	cachePath := flag.String("cache", "",
+		"embed-mode index cache path (default: <path>/.semsearch-cache.json)")
+	snippetBytes := flag.Int("snippet", 1500, "rank mode: max bytes read from the top of each file")
+	maxFiles := flag.Int("max-files", 300, "rank mode: max files to include in the LLM index")
 	noIgnore := flag.Bool("no-gitignore", false, "don't read directory names from .gitignore")
 	asJSON := flag.Bool("json", false, "output results as a JSON array (for scripting)")
-	dryRun := flag.Bool("dry-run", false, "build the index and print it; do not call the API")
+	dryRun := flag.Bool("dry-run", false, "rank mode: build the index and print it; don't call the API")
 	verbose := flag.Bool("v", false, "print an index summary to stderr")
 	flag.Parse()
 
@@ -78,7 +91,6 @@ func main() {
 			exts[strings.ToLower(e)] = true
 		}
 	}
-
 	skipDirs := buildSkipSet(defaultSkipDirs)
 	if !*noIgnore {
 		for _, d := range readGitignoreDirs(*path) {
@@ -86,51 +98,41 @@ func main() {
 		}
 	}
 
-	files, truncated, err := buildIndex(*path, exts, skipDirs, *snippetBytes, *maxFiles)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
-	if len(files) == 0 {
-		fmt.Fprintln(os.Stderr, "no matching text files found under", *path)
-		os.Exit(1)
-	}
-
-	index := renderIndex(files)
-
-	if *verbose || *dryRun {
-		fmt.Fprintf(os.Stderr, "indexed %d files (%d bytes of context)%s\n",
-			len(files), len(index), truncNote(truncated))
-	}
-	if *dryRun {
-		for _, f := range files {
-			fmt.Println("  ", f.path)
-		}
-		return
-	}
-
-	if *provider == "anthropic" && os.Getenv("ANTHROPIC_API_KEY") == "" {
-		fmt.Fprintln(os.Stderr, "error: ANTHROPIC_API_KEY is not set (or use -provider ollama)")
-		os.Exit(1)
-	}
-
-	resolvedModel := *model
-	if resolvedModel == "" {
+	// Pick the default mode per provider unless overridden.
+	if *mode == "" {
 		if *provider == "ollama" {
-			resolvedModel = envOr("OLLAMA_MODEL", "llama3.2")
+			*mode = "embed"
 		} else {
-			resolvedModel = envOr("ANTHROPIC_MODEL", "claude-opus-4-8")
+			*mode = "rank"
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	results, err := search(ctx, *provider, resolvedModel, query, index, *top)
+	var results []result
+	var err error
+
+	switch *mode {
+	case "embed":
+		results, err = embedSearch(ctx, *path, *cachePath, *embedModel, query, exts, skipDirs, *top, *verbose)
+	case "rank":
+		results, err = rankSearch(
+			ctx, *path, *provider, resolveRankModel(*model, *provider),
+			query, exts, skipDirs, *snippetBytes, *maxFiles, *top, *dryRun, *verbose,
+		)
+	default:
+		fmt.Fprintf(os.Stderr, "error: -mode must be rank or embed (got %q)\n", *mode)
+		os.Exit(2)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+	if *dryRun {
+		return // rank-mode dry-run already printed its output
+	}
+
 	sort.SliceStable(results, func(i, j int) bool { return results[i].Score > results[j].Score })
 
 	if *asJSON {
@@ -148,114 +150,50 @@ func main() {
 	}
 }
 
-func buildSkipSet(names []string) map[string]bool {
-	m := map[string]bool{}
-	for _, n := range names {
-		m[n] = true
+func resolveRankModel(model, provider string) string {
+	if model != "" {
+		return model
 	}
-	return m
+	if provider == "ollama" {
+		return envOr("OLLAMA_MODEL", "llama3.2")
+	}
+	return envOr("ANTHROPIC_MODEL", "claude-opus-4-8")
 }
 
-// readGitignoreDirs pulls plain directory-name entries out of the root
-// .gitignore (`dist/`, `build`, `.turbo/`, etc.). Glob patterns (`*.log`,
-// `**/foo`) are ignored — we only extend the directory skip set. This is
-// intentionally simple: a full gitignore parser would be a whole dependency
-// for modest additional value.
-func readGitignoreDirs(root string) []string {
-	f, err := os.Open(filepath.Join(root, ".gitignore"))
+// ── LLM-ranking mode ─────────────────────────────────────────────────────────
+
+func rankSearch(
+	ctx context.Context, root, provider, model, query string,
+	exts, skipDirs map[string]bool,
+	snippetBytes, maxFiles, top int, dryRun, verbose bool,
+) ([]result, error) {
+	files, truncated, err := buildIndex(root, exts, skipDirs, snippetBytes, maxFiles)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	defer f.Close()
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no matching text files found under %s", root)
+	}
+	index := renderIndex(files)
 
-	var out []string
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "!") {
-			continue
-		}
-		if strings.ContainsAny(line, "*?[") || strings.Contains(line, "/") && !strings.HasSuffix(line, "/") {
-			continue // glob or path expression → skip
-		}
-		line = strings.TrimSuffix(line, "/")
-		if line == "" || strings.Contains(line, "/") {
-			continue
-		}
-		out = append(out, line)
+	if verbose || dryRun {
+		fmt.Fprintf(os.Stderr, "indexed %d files (%d bytes of context)%s\n",
+			len(files), len(index), truncNote(truncated))
 	}
-	return out
+	if dryRun {
+		for _, f := range files {
+			fmt.Println("  ", f.path)
+		}
+		return nil, nil
+	}
+
+	if provider == "anthropic" && os.Getenv("ANTHROPIC_API_KEY") == "" {
+		return nil, fmt.Errorf("ANTHROPIC_API_KEY is not set (or use -mode embed, or -provider ollama)")
+	}
+	return llmRank(ctx, provider, model, query, index, top)
 }
 
-func buildIndex(root string, exts, skipDirs map[string]bool, snippetBytes, maxFiles int) ([]indexedFile, bool, error) {
-	var out []indexedFile
-	truncated := false
-	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil // skip unreadable entries
-		}
-		if d.IsDir() {
-			if skipDirs[d.Name()] {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if len(out) >= maxFiles {
-			truncated = true
-			return filepath.SkipAll
-		}
-		if !exts[strings.ToLower(filepath.Ext(p))] {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil || info.Size() > 512*1024 {
-			return nil
-		}
-		data, err := os.ReadFile(p)
-		if err != nil || isBinary(data) {
-			return nil
-		}
-		snip := string(data)
-		if len(snip) > snippetBytes {
-			snip = snip[:snippetBytes]
-		}
-		rel, e := filepath.Rel(root, p)
-		if e != nil {
-			rel = p
-		}
-		out = append(out, indexedFile{path: filepath.ToSlash(rel), snippet: snip})
-		return nil
-	})
-	return out, truncated, err
-}
-
-// isBinary reports whether data looks non-textual (contains a NUL byte).
-func isBinary(b []byte) bool {
-	n := len(b)
-	if n > 8000 {
-		n = 8000
-	}
-	for i := 0; i < n; i++ {
-		if b[i] == 0 {
-			return true
-		}
-	}
-	return false
-}
-
-func renderIndex(files []indexedFile) string {
-	var sb strings.Builder
-	for _, f := range files {
-		sb.WriteString("### ")
-		sb.WriteString(f.path)
-		sb.WriteString("\n")
-		sb.WriteString(f.snippet)
-		sb.WriteString("\n\n")
-	}
-	return sb.String()
-}
-
-func search(ctx context.Context, provider, model, query, index string, top int) ([]result, error) {
+func llmRank(ctx context.Context, provider, model, query, index string, top int) ([]result, error) {
 	system := "You are a semantic code search engine. You receive a natural-language QUERY " +
 		"and an INDEX of files, each with a snippet from the top of the file. Rank files by how " +
 		"well they match the intent and meaning of the query, not just keyword overlap. Respond " +
@@ -281,8 +219,8 @@ func search(ctx context.Context, provider, model, query, index string, top int) 
 	return results, nil
 }
 
-// complete sends a single system+user turn to the selected provider and returns
-// the model's reply text.
+// ── Chat providers (rank mode) ──────────────────────────────────────────────
+
 func complete(ctx context.Context, provider, model, system, user string) (string, error) {
 	if provider == "ollama" {
 		return ollamaChat(ctx, model, system, user)
@@ -312,8 +250,6 @@ func anthropicChat(ctx context.Context, model, system, user string) (string, err
 	return text.String(), nil
 }
 
-// ollamaChat calls a local Ollama server — no API key required. Override the
-// default host (http://localhost:11434) with OLLAMA_HOST.
 func ollamaChat(ctx context.Context, model, system, user string) (string, error) {
 	host := envOr("OLLAMA_HOST", "http://localhost:11434")
 	reqBody, _ := json.Marshal(map[string]any{
@@ -351,8 +287,96 @@ func ollamaChat(ctx context.Context, model, system, user string) (string, error)
 	return out.Message.Content, nil
 }
 
-// extractJSONArray pulls the outermost [...] out of a response, tolerating any
-// stray prose or code fences the model might wrap around it.
+// ── Shared helpers (indexer, gitignore, extraction) ─────────────────────────
+
+func buildSkipSet(names []string) map[string]bool {
+	m := map[string]bool{}
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
+}
+
+// readGitignoreDirs pulls plain directory-name entries out of the root
+// .gitignore (`dist/`, `build`, `.turbo/`). Globs and paths are ignored.
+// A full gitignore parser would be a whole dependency for modest additional
+// value at this scale.
+func readGitignoreDirs(root string) []string {
+	data, err := os.ReadFile(joinPath(root, ".gitignore"))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "!") {
+			continue
+		}
+		if strings.ContainsAny(line, "*?[") || strings.Contains(line, "/") && !strings.HasSuffix(line, "/") {
+			continue
+		}
+		line = strings.TrimSuffix(line, "/")
+		if line == "" || strings.Contains(line, "/") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+func buildIndex(root string, exts, skipDirs map[string]bool, snippetBytes, maxFiles int) ([]indexedFile, bool, error) {
+	var out []indexedFile
+	truncated := false
+	err := walkFiles(root, skipDirs, func(rel, full string, size int64) error {
+		if len(out) >= maxFiles {
+			truncated = true
+			return errStopWalk
+		}
+		if !exts[strings.ToLower(extOf(rel))] || size > 512*1024 {
+			return nil
+		}
+		data, err := os.ReadFile(full)
+		if err != nil || isBinary(data) {
+			return nil
+		}
+		snip := string(data)
+		if len(snip) > snippetBytes {
+			snip = snip[:snippetBytes]
+		}
+		out = append(out, indexedFile{path: rel, snippet: snip})
+		return nil
+	})
+	if err == errStopWalk {
+		err = nil
+	}
+	return out, truncated, err
+}
+
+func isBinary(b []byte) bool {
+	n := len(b)
+	if n > 8000 {
+		n = 8000
+	}
+	for i := 0; i < n; i++ {
+		if b[i] == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func renderIndex(files []indexedFile) string {
+	var sb strings.Builder
+	for _, f := range files {
+		sb.WriteString("### ")
+		sb.WriteString(f.path)
+		sb.WriteString("\n")
+		sb.WriteString(f.snippet)
+		sb.WriteString("\n\n")
+	}
+	return sb.String()
+}
+
 func extractJSONArray(s string) string {
 	start := strings.Index(s, "[")
 	end := strings.LastIndex(s, "]")
